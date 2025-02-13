@@ -432,6 +432,7 @@ let rec doc_pat ?(in_vector = false) (P_aux (p, (l, annot)) as pat) =
   | P_app (cons, pats) -> doc_id_ctor (fixup_match_id cons) ^^ space ^^ separate_map (string ", ") doc_pat pats
   | P_var (p, _) -> doc_pat p
   | P_as (pat, id) -> doc_pat pat
+  | P_struct _ -> string "STRUCT PAT"
   | _ -> failwith ("Doc Pattern " ^ string_of_pat_con pat ^ " " ^ string_of_pat pat ^ " not translatable yet.")
 
 (* Copied from the Coq PP *)
@@ -644,6 +645,8 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
   | E_exit _ -> string "throw Error.Exit"
   | E_assert (e1, e2) -> string "assert " ^^ d_of_arg e1 ^^ space ^^ d_of_arg e2
   | E_list es -> brackets (separate_map comma_sp (doc_exp as_monadic ctx) es)
+  | E_throw _ -> string "THROW"
+  | E_try _ -> string "TRY"
   | _ -> failwith ("Expression " ^ string_of_exp_con full_exp ^ " " ^ string_of_exp full_exp ^ " not translatable yet.")
 
 and doc_fexp with_arrow ctx (FE_aux (FE_fexp (field, e), _)) = doc_id_ctor field ^^ string " := " ^^ doc_exp false ctx e
@@ -675,7 +678,8 @@ let doc_funcl_init global (FCL_aux (FCL_funcl (id, pexp), annot)) =
            match pat_is_plain_binder env pat with
            | Some (Some id, _) -> (id, typ)
            | Some (None, _) -> (Id_aux (Id "x", l), typ) (* TODO fresh name or wildcard instead of x *)
-           | _ -> failwith "Argument pattern not translatable yet."
+           | _ -> (Id_aux (Id "TODO", Unknown), Typ_aux (Typ_id (Id_aux (Id "TODO", Unknown)), Unknown))
+           (* failwith "Argument pattern not translatable yet." *)
        )
   in
   let ctx = context_init env global in
@@ -757,6 +761,7 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
       let vars = doc_typ_quant_only_vars ctx tq in
       let vars = separate space vars in
       nest 2 (flow (break 1) (remove_empties [string "abbrev"; string id; vars; coloneq; doc_typ ctx t]))
+  | TD_abbrev _ -> string "FANCY abbrev"
   | TD_abbrev (Id_aux (Id id, _), tq, A_aux (A_nexp ne, _)) ->
       nest 2 (flow (break 1) [string "abbrev"; string id; colon; string "Int"; coloneq; doc_nexp ctx ne])
   | TD_variant (Id_aux (Id id, _), tq, ar, _) ->
