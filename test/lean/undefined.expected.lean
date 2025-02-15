@@ -3,6 +3,10 @@ import Out.Sail.BitVec
 
 open Sail
 
+set_option maxHeartbeats 1_000_000_000
+set_option maxRecDepth 10_000
+set_option linter.unusedVariables false
+
 abbrev SailM := PreSailM PEmpty.elim trivialChoiceSource Unit
 
 /-- Type quantifiers: n : Int -/
