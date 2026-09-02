@@ -5102,9 +5102,8 @@ let rec check_typedef : Env.t -> env def_annot -> uannot type_def -> typed_def l
     )
   | TD_variant (id, typq, arms, is_newtype) ->
       let rec_env = Env.add_variant ~is_newtype id (typq, arms) env in
-      (* register_value is a special type used by theorem prover
-         backends that we allow to be recursive. *)
-      let non_rec_env = if string_of_id id = "register_value" then rec_env else env in
+      (* Type-check variant arms with the variant itself in scope, allowing recursive variants. *)
+      let non_rec_env = rec_env in
       let env =
         rec_env |> fun env -> List.fold_left (fun env tu -> check_type_union l non_rec_env env id typq tu) env arms
       in

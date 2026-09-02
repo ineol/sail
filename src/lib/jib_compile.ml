@@ -1802,9 +1802,11 @@ module Make (C : CONFIG) = struct
           { ctx with records = Bindings.add id (params, ctors) ctx.records }
         )
     | TD_variant (id, typq, tus, _) ->
+        let params = quant_kopts typq |> List.filter is_typ_kopt |> List.map kopt_kid in
+        let recursive_ctx = { ctx with variants = Bindings.add id (params, Bindings.empty) ctx.variants } in
         let compile_tu = function
           | Tu_aux (Tu_ty_id (typ, id), _) ->
-              let ctx = { ctx with local_env = Env.add_typquant (id_loc id) typq ctx.local_env } in
+              let ctx = { recursive_ctx with local_env = Env.add_typquant (id_loc id) typq recursive_ctx.local_env } in
               (ctyp_of_typ ctx typ, id)
         in
         let tus =
@@ -1815,7 +1817,6 @@ module Make (C : CONFIG) = struct
         let ctus =
           List.fold_left (fun ctus (ctyp, id) -> Bindings.add id ctyp ctus) Bindings.empty (List.map compile_tu tus)
         in
-        let params = quant_kopts typq |> List.filter is_typ_kopt |> List.map kopt_kid in
         ( Some (CTD_variant (id, params, Bindings.bindings ctus)),
           { ctx with variants = Bindings.add id (params, ctus) ctx.variants }
         )
@@ -2913,8 +2914,10 @@ module Make (C : CONFIG) = struct
         IdGraph.empty ctype_defs
     in
 
-    (* Then select the ctypes in the correct order as given by the topsort *)
-    let ids = IdGraph.topsort graph in
+    (* Then select the ctypes in dependency order. Recursive variants form
+       strongly-connected components; the C backend boxes those types, so
+       definitions within such a component may be emitted in either order. *)
+    let ids = List.concat (List.rev (IdGraph.scc graph)) in
     let ctype_defs =
       List.map
         (fun id ->

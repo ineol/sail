@@ -1069,6 +1069,13 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let codegen_function_id id = string (sgen_function_id id)
 
+  (* C cannot contain a struct by value inside itself. Represent every variant
+     in a recursive type component by a heap-allocated pointer instead. *)
+  let recursive_variants = ref IdSet.empty
+  let recursive_types = ref IdSet.empty
+
+  let is_recursive_variant = function CT_variant (id, _) -> IdSet.mem id !recursive_variants | _ -> false
+
   let rec sgen_ctyp = function
     | CT_unit -> "unit"
     | CT_bool -> "bool"
@@ -1081,7 +1088,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_tup _ as tup -> "struct " ^ Util.zencode_string ("tuple_" ^ string_of_ctyp tup)
     | CT_struct (id, _) -> "struct " ^ sgen_id id
     | CT_enum id -> "enum " ^ sgen_id id
-    | CT_variant (id, _) -> "struct " ^ sgen_id id
+    | CT_variant (id, _) -> "struct " ^ sgen_id id ^ if IdSet.mem id !recursive_variants then " *" else ""
     | CT_list _ as l -> Util.zencode_string (string_of_ctyp l)
     | CT_vector _ as v -> Util.zencode_string (string_of_ctyp v)
     | CT_fvector (_, typ) -> sgen_ctyp (CT_vector typ)
@@ -1154,10 +1161,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | V_call (op, cvals) -> sgen_call op cvals
     | V_field (f, field, _) -> sprintf "%s.%s" (sgen_cval f) (sgen_id field)
     | V_tuple_member (f, _, n) -> sprintf "%s.%s" (sgen_cval f) (sgen_tuple_id n)
-    | V_ctor_kind (f, ctor) -> sgen_cval f ^ ".kind" ^ " != Kind_" ^ sgen_uid ctor
+    | V_ctor_kind (f, ctor) ->
+        sgen_cval f ^ (if is_recursive_variant (cval_ctyp f) then "->kind" else ".kind") ^ " != Kind_" ^ sgen_uid ctor
     | V_struct (fields, _) ->
         sprintf "{%s}" (Util.string_of_list ", " (fun (field, cval) -> sgen_id field ^ " = " ^ sgen_cval cval) fields)
-    | V_ctor_unwrap (f, ctor, _) -> sprintf "%s.variants.%s" (sgen_cval f) (sgen_uid ctor)
+    | V_ctor_unwrap (f, ctor, _) ->
+        sprintf "%s%svariants.%s" (sgen_cval f)
+          (if is_recursive_variant (cval_ctyp f) then "->" else ".")
+          (sgen_uid ctor)
     | V_tuple _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Cannot generate C value for a tuple literal"
 
   and sgen_call op cvals =
@@ -1747,6 +1758,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           )
         @ [StaticFunctionDefinition struct_eq]
     | CTD_variant (id, _, tus) ->
+        let recursive = IdSet.mem id !recursive_variants in
+        let ref_member v = if recursive then "(*" ^ v ^ ")->" else v ^ "->" in
+        let value_member v = if recursive then v ^ "->" else v ^ "." in
         let codegen_tu (ctor_id, ctyp) =
           separate space [string "struct"; lbrace; string (sgen_ctyp ctyp); codegen_id ctor_id ^^ semi; rbrace]
         in
@@ -1767,40 +1781,57 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         in
         let codegen_init =
           let n = sgen_id id in
-          let ctor_id, ctyp = List.hd tus in
-          c_function ~return:"static void" (sail_create n "struct %s *op" n)
-            ([string (Printf.sprintf "op->kind = Kind_%s;" (sgen_id ctor_id))]
+          let ctor_id, ctyp =
+            if recursive then (
+              match List.find_opt (fun (_, ctyp) -> IdSet.disjoint (ctyp_ids ctyp) !recursive_types) tus with
+              | Some ctor -> ctor
+              | None -> c_error (Printf.sprintf "Recursive union %s has no finite constructor" (string_of_id id))
+            )
+            else List.hd tus
+          in
+          c_function ~return:"static void"
+            (sail_create n "struct %s %sop" n (if recursive then "**" else "*"))
+            ((if recursive then [string (Printf.sprintf "*op = sail_new(struct %s);" n)] else [])
+            @ [string (Printf.sprintf "%skind = Kind_%s;" (ref_member "op") (sgen_id ctor_id))]
             @
             if not (is_stack_ctyp ctx ctyp) then
-              [sail_create ~suffix:";" (sgen_ctyp_name ctyp) "&op->variants.%s" (sgen_id ctor_id)]
+              [sail_create ~suffix:";" (sgen_ctyp_name ctyp) "&%svariants.%s" (ref_member "op") (sgen_id ctor_id)]
             else []
             )
         in
         let codegen_reinit =
           let n = sgen_id id in
-          c_function ~return:"static void" (sail_recreate n "struct %s *op" n) []
+          c_function ~return:"static void" (sail_recreate n "struct %s %sop" n (if recursive then "**" else "*")) []
         in
         let clear_field v ctor_id ctyp =
           if is_stack_ctyp ctx ctyp then None
-          else Some (sail_kill ~suffix:";" (sgen_ctyp_name ctyp) "&%s->variants.%s" v (sgen_id ctor_id))
+          else Some (sail_kill ~suffix:";" (sgen_ctyp_name ctyp) "&%svariants.%s" (ref_member v) (sgen_id ctor_id))
         in
         let codegen_clear =
           let n = sgen_id id in
-          c_function ~return:"static void" (sail_kill n "struct %s *op" n) [each_ctor "op->" (clear_field "op") tus]
+          c_function ~return:"static void"
+            (sail_kill n "struct %s %sop" n (if recursive then "**" else "*"))
+            ([each_ctor (ref_member "op") (clear_field "op") tus]
+            @ if recursive then [string "sail_free(*op);"; string "*op = NULL;"] else []
+            )
         in
         let codegen_ctor (ctor_id, ctyp) =
           let ctor_args = Printf.sprintf "%s op" (sgen_const_ctyp ctyp) in
           c_function ~return:"static void"
-            (ksprintf string "%s(%sstruct %s *rop, %s)" (sgen_function_id ctor_id) (extra_params ()) (sgen_id id)
+            (ksprintf string "%s(%sstruct %s %srop, %s)" (sgen_function_id ctor_id) (extra_params ()) (sgen_id id)
+               (if recursive then "**" else "*")
                ctor_args
             )
-            ([each_ctor "rop->" (clear_field "rop") tus; string ("rop->kind = Kind_" ^ sgen_id ctor_id) ^^ semi]
+            ([
+               each_ctor (ref_member "rop") (clear_field "rop") tus;
+               string (ref_member "rop" ^ "kind = Kind_" ^ sgen_id ctor_id) ^^ semi;
+             ]
             @
-            if is_stack_ctyp ctx ctyp then [ksprintf string "rop->variants.%s = op;" (sgen_id ctor_id)]
+            if is_stack_ctyp ctx ctyp then [ksprintf string "%svariants.%s = op;" (ref_member "rop") (sgen_id ctor_id)]
             else
               [
-                sail_create ~suffix:";" (sgen_ctyp_name ctyp) "&rop->variants.%s" (sgen_id ctor_id);
-                sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->variants.%s, op" (sgen_id ctor_id);
+                sail_create ~suffix:";" (sgen_ctyp_name ctyp) "&%svariants.%s" (ref_member "rop") (sgen_id ctor_id);
+                sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&%svariants.%s, op" (ref_member "rop") (sgen_id ctor_id);
               ]
             )
         in
@@ -1809,33 +1840,43 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           let set_field ctor_id ctyp =
             Some
               ( if is_stack_ctyp ctx ctyp then
-                  string (Printf.sprintf "rop->variants.%s = op.variants.%s;" (sgen_id ctor_id) (sgen_id ctor_id))
+                  string
+                    (Printf.sprintf "%svariants.%s = %svariants.%s;" (ref_member "rop") (sgen_id ctor_id)
+                       (value_member "op") (sgen_id ctor_id)
+                    )
                 else
-                  sail_create ~suffix:";" (sgen_ctyp_name ctyp) "&rop->variants.%s" (sgen_id ctor_id)
-                  ^^ sail_copy ~prefix:" " ~suffix:";" (sgen_ctyp_name ctyp) "&rop->variants.%s, op.variants.%s"
-                       (sgen_id ctor_id) (sgen_id ctor_id)
+                  sail_create ~suffix:";" (sgen_ctyp_name ctyp) "&%svariants.%s" (ref_member "rop") (sgen_id ctor_id)
+                  ^^ sail_copy ~prefix:" " ~suffix:";" (sgen_ctyp_name ctyp) "&%svariants.%s, %svariants.%s"
+                       (ref_member "rop") (sgen_id ctor_id) (value_member "op") (sgen_id ctor_id)
               )
           in
           c_function ~return:"static void"
-            (sail_copy n "struct %s *rop, struct %s op" n n)
+            (sail_copy n "struct %s %srop, struct %s %sop" n
+               (if recursive then "**" else "*")
+               n
+               (if recursive then "*" else "")
+            )
             [
-              each_ctor "rop->" (clear_field "rop") tus ^^ semi;
-              c_stmt "rop->kind = op.kind";
-              each_ctor "op." set_field tus;
+              each_ctor (ref_member "rop") (clear_field "rop") tus ^^ semi;
+              c_stmt (ref_member "rop" ^ "kind = " ^ value_member "op" ^ "kind");
+              each_ctor (value_member "op") set_field tus;
             ]
         in
         let codegen_eq =
           let codegen_eq_test ctor_id ctyp =
             c_return
               (codegen_equal ctyp
-                 (sprintf "op1.variants.%s" (sgen_id ctor_id))
-                 (sprintf "op2.variants.%s" (sgen_id ctor_id))
+                 (sprintf "%svariants.%s" (value_member "op1") (sgen_id ctor_id))
+                 (sprintf "%svariants.%s" (value_member "op2") (sgen_id ctor_id))
               )
           in
           let codegen_eq_tests ctors =
-            c_if (ksprintf string "(op1.kind != op2.kind)") [c_return (string "false")]
+            c_if
+              (ksprintf string "(%skind != %skind)" (value_member "op1") (value_member "op2"))
+              [c_return (string "false")]
             ^^ hardline
-            ^^ c_switch (string "(op1.kind)")
+            ^^ c_switch
+                 (string ("(" ^ value_member "op1" ^ "kind)"))
                  (List.map
                     (fun (ctor_id, ctyp) ->
                       (ksprintf string "Kind_%s" (sgen_id ctor_id), [codegen_eq_test ctor_id ctyp])
@@ -1847,7 +1888,13 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             ^^ c_return (string "false")
           in
           let n = sgen_id id in
-          c_function ~return:"static bool" (sail_equal n "struct %s op1, struct %s op2" n n) [codegen_eq_tests tus]
+          c_function ~return:"static bool"
+            (sail_equal n "struct %s %sop1, struct %s %sop2" n
+               (if recursive then "*" else "")
+               n
+               (if recursive then "*" else "")
+            )
+            [codegen_eq_tests tus]
         in
         [
           TypeDeclaration
@@ -2662,9 +2709,75 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         );
     ]
 
+  let find_recursive_types cdefs =
+    let module TypeGraph = Graph.Make (Id) in
+    let type_defs = List.filter_map (function CDEF_aux (CDEF_type ctd, _) -> Some ctd | _ -> None) cdefs in
+    let type_id = function
+      | CTD_abstract (id, _, _) | CTD_enum (id, _) | CTD_abbrev (id, _) | CTD_struct (id, _, _) | CTD_variant (id, _, _)
+        ->
+          id
+    in
+    let graph =
+      List.fold_left
+        (fun graph ctd ->
+          let id = type_id ctd in
+          let dependencies =
+            match ctd with
+            | CTD_abstract _ | CTD_enum _ -> IdSet.empty
+            | CTD_abbrev (_, ctyp) -> ctyp_ids ctyp
+            | CTD_struct (_, _, fields) | CTD_variant (_, _, fields) ->
+                List.fold_left (fun ids (_, ctyp) -> IdSet.union ids (ctyp_ids ctyp)) IdSet.empty fields
+          in
+          TypeGraph.add_edges id (IdSet.elements dependencies) graph
+        )
+        TypeGraph.empty type_defs
+    in
+    let variant_ids =
+      List.fold_left (fun ids -> function CTD_variant (id, _, _) -> IdSet.add id ids | _ -> ids) IdSet.empty type_defs
+    in
+    List.fold_left
+      (fun (recursive_variants, recursive_types) component ->
+        let cyclic =
+          match component with [id] -> TypeGraph.has_edge id id graph | _ :: _ :: _ -> true | [] -> false
+        in
+        if cyclic then
+          ( List.fold_left
+              (fun recursive id -> if IdSet.mem id variant_ids then IdSet.add id recursive else recursive)
+              recursive_variants component,
+            List.fold_left (fun recursive id -> IdSet.add id recursive) recursive_types component
+          )
+        else (recursive_variants, recursive_types)
+      )
+      (IdSet.empty, IdSet.empty) (TypeGraph.scc graph)
+
+  let type_forward_declarations cdefs =
+    List.concat_map
+      (function
+        | CDEF_aux (CDEF_type (CTD_struct (id, _, _) | CTD_variant (id, _, _)), _) ->
+            let name = sgen_id id in
+            let declaration = TypeDeclaration (ksprintf string "struct %s;" name) in
+            if IdSet.mem id !recursive_variants then
+              [
+                declaration;
+                StaticFunctionDefinition (ksprintf string "static void CREATE(%s)(struct %s **);" name name);
+                StaticFunctionDefinition (ksprintf string "static void RECREATE(%s)(struct %s **);" name name);
+                StaticFunctionDefinition (ksprintf string "static void KILL(%s)(struct %s **);" name name);
+                StaticFunctionDefinition
+                  (ksprintf string "static void COPY(%s)(struct %s **, struct %s *);" name name name);
+                StaticFunctionDefinition
+                  (ksprintf string "static bool EQUAL(%s)(struct %s *, struct %s *);" name name name);
+              ]
+            else [declaration]
+        | _ -> []
+        )
+      cdefs
+
   let compile_ast env effect_info basename ast =
     try
       let cdefs, ctx = jib_of_ast env effect_info ast in
+      let variants, types = find_recursive_types cdefs in
+      recursive_variants := variants;
+      recursive_types := types;
       (* let cdefs', _ = Jib_optimize.remove_tuples cdefs ctx in *)
       let cdefs = insert_heap_returns ctx Bindings.empty cdefs in
 
@@ -2677,7 +2790,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
          some value < 256 (100 seems reasonable). *)
       let cdefs = List.map (Jib_optimize.flatten_cdef ~max_depth:100) cdefs in
 
-      let docs = List.map (codegen_def ctx) cdefs |> List.concat in
+      let docs = type_forward_declarations cdefs @ (List.map (codegen_def ctx) cdefs |> List.concat) in
 
       let docs = docs @ gen_model_init_fini ctx cdefs @ gen_unit_test_defs ctx cdefs in
       let docs = if Config.cpp then docs @ gen_constructor_destructor ctx cdefs else docs in
